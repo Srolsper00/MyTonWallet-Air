@@ -1,0 +1,363 @@
+  1  # Copyright (C) 2001-2007, 2009-2011 Nominum, Inc. 
+  2  # 
+  3  # Permission to use, copy, modify, and distribute this software and its 
+  4  # documentation for any purpose with or without fee is hereby granted, 
+  5  # provided that the above copyright notice and this permission notice 
+  6  # appear in all copies. 
+  7  # 
+  8  # THE SOFTWARE IS PROVIDED "AS IS" AND NOMINUM DISCLAIMS ALL WARRANTIES 
+  9  # WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF 
+ 10  # MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL NOMINUM BE LIABLE FOR 
+ 11  # ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES 
+ 12  # WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN 
+ 13  # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT 
+ 14  # OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. 
+ 15   
+ 16  """Help for building DNS wire format messages""" 
+ 17   
+ 18  from io import BytesIO 
+ 19  import struct 
+ 20  import random 
+ 21  import time 
+ 22   
+ 23  import dns.exception 
+ 24  import dns.tsig 
+ 25  from ._compat import long 
+ 26   
+ 27   
+ 28  QUESTION = 0 
+ 29  ANSWER = 1 
+ 30  AUTHORITY = 2 
+ 31  ADDITIONAL = 3 
+ 32   
+ 33   
+ 34 -class Renderer(object): 
+ 35   
+ 36      """Helper class for building DNS wire-format messages. 
+ 37   
+ 38      Most applications can use the higher-level L{dns.message.Message} 
+ 39      class and its to_wire() method to generate wire-format messages. 
+ 40      This class is for those applications which need finer control 
+ 41      over the generation of messages. 
+ 42   
+ 43      Typical use:: 
+ 44   
+ 45          r = dns.renderer.Renderer(id=1, flags=0x80, max_size=512) 
+ 46          r.add_question(qname, qtype, qclass) 
+ 47          r.add_rrset(dns.renderer.ANSWER, rrset_1) 
+ 48          r.add_rrset(dns.renderer.ANSWER, rrset_2) 
+ 49          r.add_rrset(dns.renderer.AUTHORITY, ns_rrset) 
+ 50          r.add_edns(0, 0, 4096) 
+ 51          r.add_rrset(dns.renderer.ADDTIONAL, ad_rrset_1) 
+ 52          r.add_rrset(dns.renderer.ADDTIONAL, ad_rrset_2) 
+ 53          r.write_header() 
+ 54          r.add_tsig(keyname, secret, 300, 1, 0, '', request_mac) 
+ 55          wire = r.get_wire() 
+ 56   
+ 57      @ivar output: where rendering is written 
+ 58      @type output: BytesIO object 
+ 59      @ivar id: the message id 
+ 60      @type id: int 
+ 61      @ivar flags: the message flags 
+ 62      @type flags: int 
+ 63      @ivar max_size: the maximum size of the message 
+ 64      @type max_size: int 
+ 65      @ivar origin: the origin to use when rendering relative names 
+ 66      @type origin: dns.name.Name object 
+ 67      @ivar compress: the compression table 
+ 68      @type compress: dict 
+ 69      @ivar section: the section currently being rendered 
+ 70      @type section: int (dns.renderer.QUESTION, dns.renderer.ANSWER, 
+ 71      dns.renderer.AUTHORITY, or dns.renderer.ADDITIONAL) 
+ 72      @ivar counts: list of the number of RRs in each section 
+ 73      @type counts: int list of length 4 
+ 74      @ivar mac: the MAC of the rendered message (if TSIG was used) 
+ 75      @type mac: string 
+ 76      """ 
+ 77   
+ 78 -    def __init__(self, id=None, flags=0, max_size=65535, origin=None): 
+ 79          """Initialize a new renderer. 
+ 80   
+ 81          @param id: the message id 
+ 82          @type id: int 
+ 83          @param flags: the DNS message flags 
+ 84          @type flags: int 
+ 85          @param max_size: the maximum message size; the default is 65535. 
+ 86          If rendering results in a message greater than I{max_size}, 
+ 87          then L{dns.exception.TooBig} will be raised. 
+ 88          @type max_size: int 
+ 89          @param origin: the origin to use when rendering relative names 
+ 90          @type origin: dns.name.Name or None. 
+ 91          """ 
+ 92   
+ 93          self.output = BytesIO() 
+ 94          if id is None: 
+ 95              self.id = random.randint(0, 65535) 
+ 96          else: 
+ 97              self.id = id 
+ 98          self.flags = flags 
+ 99          self.max_size = max_size 
+100          self.origin = origin 
+101          self.compress = {} 
+102          self.section = QUESTION 
+103          self.counts = [0, 0, 0, 0] 
+104          self.output.write(b'\x00' * 12) 
+105          self.mac = '' 
+106   
+107 -    def _rollback(self, where): 
+108          """Truncate the output buffer at offset I{where}, and remove any 
+109          compression table entries that pointed beyond the truncation 
+110          point. 
+111   
+112          @param where: the offset 
+113          @type where: int 
+114          """ 
+115   
+116          self.output.seek(where) 
+117          self.output.truncate() 
+118          keys_to_delete = [] 
+119          for k, v in self.compress.items(): 
+120              if v >= where: 
+121                  keys_to_delete.append(k) 
+122          for k in keys_to_delete: 
+123              del self.compress[k] 
+124   
+125 -    def _set_section(self, section): 
+126          """Set the renderer's current section. 
+127   
+128          Sections must be rendered order: QUESTION, ANSWER, AUTHORITY, 
+129          ADDITIONAL.  Sections may be empty. 
+130   
+131          @param section: the section 
+132          @type section: int 
+133          @raises dns.exception.FormError: an attempt was made to set 
+134          a section value less than the current section. 
+135          """ 
+136   
+137          if self.section != section: 
+138              if self.section > section: 
+139                  raise dns.exception.FormError 
+140              self.section = section 
+141   
+142 -    def add_question(self, qname, rdtype, rdclass=dns.rdataclass.IN): 
+143          """Add a question to the message. 
+144   
+145          @param qname: the question name 
+146          @type qname: dns.name.Name 
+147          @param rdtype: the question rdata type 
+148          @type rdtype: int 
+149          @param rdclass: the question rdata class 
+150          @type rdclass: int 
+151          """ 
+152   
+153          self._set_section(QUESTION) 
+154          before = self.output.tell() 
+155          qname.to_wire(self.output, self.compress, self.origin) 
+156          self.output.write(struct.pack("!HH", rdtype, rdclass)) 
+157          after = self.output.tell() 
+158          if after >= self.max_size: 
+159              self._rollback(before) 
+160              raise dns.exception.TooBig 
+161          self.counts[QUESTION] += 1 
+162   
+163 -    def add_rrset(self, section, rrset, **kw): 
+164          """Add the rrset to the specified section. 
+165   
+166          Any keyword arguments are passed on to the rdataset's to_wire() 
+167          routine. 
+168   
+169          @param section: the section 
+170          @type section: int 
+171          @param rrset: the rrset 
+172          @type rrset: dns.rrset.RRset object 
+173          """ 
+174   
+175          self._set_section(section) 
+176          before = self.output.tell() 
+177          n = rrset.to_wire(self.output, self.compress, self.origin, **kw) 
+178          after = self.output.tell() 
+179          if after >= self.max_size: 
+180              self._rollback(before) 
+181              raise dns.exception.TooBig 
+182          self.counts[section] += n 
+183   
+184 -    def add_rdataset(self, section, name, rdataset, **kw): 
+185          """Add the rdataset to the specified section, using the specified 
+186          name as the owner name. 
+187   
+188          Any keyword arguments are passed on to the rdataset's to_wire() 
+189          routine. 
+190   
+191          @param section: the section 
+192          @type section: int 
+193          @param name: the owner name 
+194          @type name: dns.name.Name object 
+195          @param rdataset: the rdataset 
+196          @type rdataset: dns.rdataset.Rdataset object 
+197          """ 
+198   
+199          self._set_section(section) 
+200          before = self.output.tell() 
+201          n = rdataset.to_wire(name, self.output, self.compress, self.origin, 
+202                               **kw) 
+203          after = self.output.tell() 
+204          if after >= self.max_size: 
+205              self._rollback(before) 
+206              raise dns.exception.TooBig 
+207          self.counts[section] += n 
+208   
+209 -    def add_edns(self, edns, ednsflags, payload, options=None): 
+210          """Add an EDNS OPT record to the message. 
+211   
+212          @param edns: The EDNS level to use. 
+213          @type edns: int 
+214          @param ednsflags: EDNS flag values. 
+215          @type ednsflags: int 
+216          @param payload: The EDNS sender's payload field, which is the maximum 
+217          size of UDP datagram the sender can handle. 
+218          @type payload: int 
+219          @param options: The EDNS options list 
+220          @type options: list of dns.edns.Option instances 
+221          @see: RFC 2671 
+222          """ 
+223   
+224          # make sure the EDNS version in ednsflags agrees with edns 
+225          ednsflags &= long(0xFF00FFFF) 
+226          ednsflags |= (edns << 16) 
+227          self._set_section(ADDITIONAL) 
+228          before = self.output.tell() 
+229          self.output.write(struct.pack('!BHHIH', 0, dns.rdatatype.OPT, payload, 
+230                                        ednsflags, 0)) 
+231          if options is not None: 
+232              lstart = self.output.tell() 
+233              for opt in options: 
+234                  stuff = struct.pack("!HH", opt.otype, 0) 
+235                  self.output.write(stuff) 
+236                  start = self.output.tell() 
+237                  opt.to_wire(self.output) 
+238                  end = self.output.tell() 
+239                  assert end - start < 65536 
+240                  self.output.seek(start - 2) 
+241                  stuff = struct.pack("!H", end - start) 
+242                  self.output.write(stuff) 
+243                  self.output.seek(0, 2) 
+244              lend = self.output.tell() 
+245              assert lend - lstart < 65536 
+246              self.output.seek(lstart - 2) 
+247              stuff = struct.pack("!H", lend - lstart) 
+248              self.output.write(stuff) 
+249              self.output.seek(0, 2) 
+250          after = self.output.tell() 
+251          if after >= self.max_size: 
+252              self._rollback(before) 
+253              raise dns.exception.TooBig 
+254          self.counts[ADDITIONAL] += 1 
+255   
+256 -    def add_tsig(self, keyname, secret, fudge, id, tsig_error, other_data, 
+257                   request_mac, algorithm=dns.tsig.default_algorithm): 
+258          """Add a TSIG signature to the message. 
+259   
+260          @param keyname: the TSIG key name 
+261          @type keyname: dns.name.Name object 
+262          @param secret: the secret to use 
+263          @type secret: string 
+264          @param fudge: TSIG time fudge 
+265          @type fudge: int 
+266          @param id: the message id to encode in the tsig signature 
+267          @type id: int 
+268          @param tsig_error: TSIG error code; default is 0. 
+269          @type tsig_error: int 
+270          @param other_data: TSIG other data. 
+271          @type other_data: string 
+272          @param request_mac: This message is a response to the request which 
+273          had the specified MAC. 
+274          @type request_mac: string 
+275          @param algorithm: the TSIG algorithm to use 
+276          @type algorithm: dns.name.Name object 
+277          """ 
+278   
+279          self._set_section(ADDITIONAL) 
+280          before = self.output.tell() 
+281          s = self.output.getvalue() 
+282          (tsig_rdata, self.mac, ctx) = dns.tsig.sign(s, 
+283                                                      keyname, 
+284                                                      secret, 
+285                                                      int(time.time()), 
+286                                                      fudge, 
+287                                                      id, 
+288                                                      tsig_error, 
+289                                                      other_data, 
+290                                                      request_mac, 
+291                                                      algorithm=algorithm) 
+292          keyname.to_wire(self.output, self.compress, self.origin) 
+293          self.output.write(struct.pack('!HHIH', dns.rdatatype.TSIG, 
+294                                        dns.rdataclass.ANY, 0, 0)) 
+295          rdata_start = self.output.tell() 
+296          self.output.write(tsig_rdata) 
+297          after = self.output.tell() 
+298          assert after - rdata_start < 65536 
+299          if after >= self.max_size: 
+300              self._rollback(before) 
+301              raise dns.exception.TooBig 
+302          self.output.seek(rdata_start - 2) 
+303          self.output.write(struct.pack('!H', after - rdata_start)) 
+304          self.counts[ADDITIONAL] += 1 
+305          self.output.seek(10) 
+306          self.output.write(struct.pack('!H', self.counts[ADDITIONAL])) 
+307          self.output.seek(0, 2) 
+308   
+309 -    def write_header(self): 
+310          """Write the DNS message header. 
+311   
+312          Writing the DNS message header is done after all sections 
+313          have been rendered, but before the optional TSIG signature 
+314          is added. 
+315          """ 
+316   
+317          self.output.seek(0) 
+318          self.output.write(struct.pack('!HHHHHH', self.id, self.flags, 
+319                                        self.counts[0], self.counts[1], 
+320                                        self.counts[2], self.counts[3])) 
+321          self.output.seek(0, 2) 
+322   
+323 -    def get_wire(self): 
+324          """Return the wire format message. 
+325   
+326          @rtype: string 
+327          """ 
+328   
+329          return self.output.getvalue() 
+330   
+
+   Home   	   Trees   	   Indices   	   Help   	
+dnspython
+Generated by Epydoc 3.0.1 on Fri Sep 30 08:16:43 2016	http://epydoc.sourceforge.net
+name: NodeJS with Grunt
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x, 22.x]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+
+    - name: Build
+      run: |
+        npm install
+        grunt
+
